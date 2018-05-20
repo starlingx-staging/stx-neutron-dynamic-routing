@@ -13,6 +13,7 @@
 # under the License.
 
 import contextlib
+import keyring  # noqa
 
 import mock
 import netaddr
@@ -27,6 +28,8 @@ from neutron_lib.plugins import constants as plugin_constants
 from neutron_lib.plugins import directory
 from oslo_config import cfg
 from oslo_utils import uuidutils
+
+from networking_bgpvpn.neutron.db import bgpvpn_db
 
 from neutron_dynamic_routing.extensions import bgp
 from neutron_dynamic_routing.services.bgp import bgp_plugin
@@ -73,10 +76,11 @@ class BgpEntityCreationMixin(object):
     @contextlib.contextmanager
     def bgp_peer(self, tenant_id=_uuid(), remote_as='4321',
                  peer_ip="192.168.1.1", auth_type="md5",
-                 password="my-secret", name="my-peer"):
+                 password="my-secret", name="my-peer", hold_time=30):
         data = {'peer_ip': peer_ip, 'tenant_id': tenant_id,
                 'remote_as': remote_as, 'auth_type': auth_type,
-                'password': password, 'name': name}
+                'password': password, 'name': name,
+                'hold_time': hold_time}
         bgp_peer = self.bgp_plugin.create_bgp_peer(self.context,
                                                    {'bgp_peer': data})
         yield bgp_peer
@@ -1310,6 +1314,9 @@ class Ml2BgpTests(test_plugin.Ml2PluginV2TestCase,
     def setup_parent(self):
         self.l3_plugin = ('neutron_dynamic_routing.tests.unit.db.test_bgp_db.'
                           'TestL3Plugin')
+        self.bgpvpn_db = bgpvpn_db.BGPVPNPluginDb()
+        mock.patch('keyring.set_password').start()
+        mock.patch('keyring.delete_password').start()
         super(Ml2BgpTests, self).setup_parent()
 
     def setUp(self):

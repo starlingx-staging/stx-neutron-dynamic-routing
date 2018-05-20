@@ -52,6 +52,10 @@ class InvalidParamRange(n_exc.NeutronException):
     message = _("%(param)s must be in %(range)s range.")
 
 
+class InvalidParamValue(n_exc.BadRequest):
+    message = _("%(value)s not supported for parameter %(param)s.")
+
+
 class InvaildAuthType(n_exc.BadRequest):
     message = _("Authentication type not supported. Requested "
                 "type=%(auth_type)s.")

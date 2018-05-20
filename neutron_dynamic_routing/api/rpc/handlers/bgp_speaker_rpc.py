@@ -54,8 +54,8 @@ class BgpSpeakerRpcCallback(object):
         Invoked by the BgpDrAgent to lookup the details of a BGP peer.
         """
         return self.plugin.get_bgp_peer(context, bgp_peer_id,
-                                        ['peer_ip', 'remote_as',
-                                         'auth_type', 'password'])
+                                        ['id', 'peer_ip', 'remote_as',
+                                         'auth_type', 'password', 'hold_time'])
 
     def get_bgp_speakers(self, context, host=None, **kwargs):
         """Returns the list of all BgpSpeakers.
@@ -63,3 +63,11 @@ class BgpSpeakerRpcCallback(object):
         Typically invoked by the BgpDrAgent as part of its bootstrap process.
         """
         return self.plugin.get_bgp_speakers_for_agent_host(context, host)
+
+    def update_bgp_dragent_peer_state(self, context, host,
+                                      remote_ip, remote_as,
+                                      peer_state):
+        """Save bgp-dragent peer state to DB."""
+        return self.plugin.create_or_update_bgp_dragent_peer_state(
+            context, host, remote_ip, remote_as, peer_state
+        )

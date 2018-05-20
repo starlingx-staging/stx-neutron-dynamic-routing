@@ -16,6 +16,7 @@
 
 from neutron_lib.api import converters as n_conv
 from neutron_lib.api import extensions
+from neutron_lib.api import validators
 from neutron_lib.db import constants as db_const
 from neutron_lib import exceptions as n_exc
 
@@ -23,6 +24,24 @@ from neutron.api.v2 import resource_helper as rh
 
 from neutron_dynamic_routing._i18n import _
 from neutron_dynamic_routing.services.bgp.common import constants as bgp_consts
+
+
+def _validate_bgp_hold_time(data, valid_values=None):
+    if data is None or data is "":
+        return
+
+    try:
+        value = int(data)
+        if value < 10:
+            msg = _("Hold time must be at least 10 seconds")
+            return msg
+    except ValueError:
+        msg = _("Hold time '%s' is not an integer") % data
+        return msg
+
+
+validators.add_validator('type:bgp_hold_time', _validate_bgp_hold_time)
+
 
 BGP_EXT_ALIAS = 'bgp'
 BGP_SPEAKER_RESOURCE_NAME = 'bgp-speaker'
@@ -80,6 +99,11 @@ RESOURCE_ATTRIBUTE_MAP = {
                                       'is_visible': True, 'default': True,
                                       'required_by_policy': False,
                                       'enforce_policy': True},
+        'vpns': {'allow_post': False, 'allow_put': False,
+                 'validate': {'type:uuid_list': None},
+                 'is_visible': True, 'default': [],
+                 'required_by_policy': False,
+                 'enforce_policy': True},
     },
     'bgp-peers': {
         'id': {'allow_post': False, 'allow_put': False,
@@ -108,11 +132,19 @@ RESOURCE_ATTRIBUTE_MAP = {
                      'validate': {'type:string_or_none': None},
                      'is_visible': False,
                      'default': None},
+        'hold_time': {'allow_post': True, 'allow_put': True,
+                      'required_by_policy': True,
+                      'validate': {'type:bgp_hold_time': None},
+                      'is_visible': True,
+                      'default': bgp_consts.DEFAULT_HOLD_TIME},
         'tenant_id': {'allow_post': True, 'allow_put': False,
                       'required_by_policy': False,
                       'validate': {
                           'type:string': db_const.PROJECT_ID_FIELD_SIZE},
-                      'is_visible': True}
+                      'is_visible': True},
+        'agent_connectivity': {'allow_post': False, 'allow_put': False,
+                               'required_by_policy': False,
+                               'is_visible': True},
     }
 }
 
@@ -164,6 +196,20 @@ class NetworkNotBoundForIpVersion(NetworkNotBound):
                 "BgpSpeaker.")
 
 
+class BgpVpnNotFound(n_exc.NotFound):
+    message = _("BGP VPN %(vpn_id)s could not be found.")
+
+
+class BgpSpeakerVpnBindingError(n_exc.Conflict):
+    message = _("BGP VPN %(vpn_id)s is already bound to BgpSpeaker "
+                "%(bgp_speaker_id)s.")
+
+
+class BgpSpeakerVpnNotAssociated(n_exc.NotFound):
+    message = _("VPN %(vpn_id)s is not associated with "
+                "BGP speaker %(bgp_speaker_id)s.")
+
+
 class Bgp(extensions.ExtensionDescriptor):
 
     @classmethod
@@ -192,6 +238,8 @@ class Bgp(extensions.ExtensionDescriptor):
                        'remove_bgp_peer': 'PUT',
                        'add_gateway_network': 'PUT',
                        'remove_gateway_network': 'PUT',
+                       'add_bgp_vpn': 'PUT',
+                       'remove_bgp_vpn': 'PUT',
                        'get_advertised_routes': 'GET'}}
         exts = rh.build_resource_info(plural_mappings,
                                       RESOURCE_ATTRIBUTE_MAP,

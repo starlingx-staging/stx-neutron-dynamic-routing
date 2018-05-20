@@ -59,11 +59,11 @@ class TestRyuBgpDriver(base.BaseTestCase):
         self.assertEqual(1,
                 self.ryu_bgp_driver.cache.get_hosted_bgp_speakers_count())
         self.mock_ryu_speaker.assert_called_once_with(
-                 as_number=FAKE_LOCAL_AS1, router_id=FAKE_ROUTER_ID,
-                 bgp_server_port=0,
-                 best_path_change_handler=ryu_driver.best_path_change_cb,
-                 peer_down_handler=ryu_driver.bgp_peer_down_cb,
-                 peer_up_handler=ryu_driver.bgp_peer_up_cb)
+             as_number=FAKE_LOCAL_AS1, router_id=FAKE_ROUTER_ID,
+             bgp_server_port=179,
+             best_path_change_handler=self.ryu_bgp_driver.best_path_change_cb,
+             peer_down_handler=self.ryu_bgp_driver.bgp_peer_down_cb,
+             peer_up_handler=self.ryu_bgp_driver.bgp_peer_up_cb)
 
     def test_remove_bgp_speaker(self):
         self.ryu_bgp_driver.add_bgp_speaker(FAKE_LOCAL_AS1)

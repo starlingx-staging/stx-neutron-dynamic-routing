@@ -16,10 +16,13 @@
 
 import mock
 
+from neutron.callbacks import resources as n_resources
 from neutron.tests import base
 from neutron_lib.callbacks import events
 from neutron_lib.callbacks import registry
 from neutron_lib.callbacks import resources
+
+from networking_bgpvpn.neutron.callback import resources as bgpvpn_res
 
 from neutron_dynamic_routing.api.rpc.callbacks import resources as dr_resources
 from neutron_dynamic_routing.db import bgp_db
@@ -52,6 +55,31 @@ class TestBgpPlugin(base.BaseTestCase):
         with mock.patch.object(registry, 'subscribe') as subscribe:
             plugin = bgp_plugin.BgpPlugin()
             expected_calls = [
+                mock.call(plugin.bgpvpn_router_port_create_callback,
+                          resources.ROUTER_INTERFACE, events.AFTER_CREATE),
+                mock.call(plugin.bgpvpn_router_port_delete_callback,
+                          resources.ROUTER_INTERFACE, events.AFTER_DELETE),
+                mock.call(
+                    plugin.bgpvpn_sunetpool_change_address_scope_callback,
+                    resources.SUBNETPOOL_ADDRESS_SCOPE, events.AFTER_UPDATE),
+                mock.call(plugin.bgpvpn_speaker_delete_callback,
+                          dr_resources.BGP_SPEAKER, events.AFTER_DELETE),
+                mock.call(plugin.bgpvpn_create_callback,
+                          bgpvpn_res.BGPVPN, events.AFTER_CREATE),
+                mock.call(plugin.bgpvpn_update_callback,
+                          bgpvpn_res.BGPVPN, events.AFTER_UPDATE),
+                mock.call(plugin.bgpvpn_delete_callback,
+                          bgpvpn_res.BGPVPN, events.AFTER_DELETE),
+                mock.call(plugin.bgpvpn_router_assoc_callback,
+                          bgpvpn_res.BGPVPN_ROUTER_ASSOC, events.AFTER_CREATE),
+                mock.call(plugin.bgpvpn_router_assoc_callback,
+                          bgpvpn_res.BGPVPN_ROUTER_ASSOC, events.AFTER_DELETE),
+                mock.call(plugin.bgpvpn_network_assoc_callback,
+                          bgpvpn_res.BGPVPN_NETWORK_ASSOC,
+                          events.AFTER_CREATE),
+                mock.call(plugin.bgpvpn_network_assoc_callback,
+                          bgpvpn_res.BGPVPN_NETWORK_ASSOC,
+                          events.AFTER_DELETE),
                 mock.call(plugin.bgp_drscheduler.schedule_bgp_speaker_callback,
                           dr_resources.BGP_SPEAKER, events.AFTER_CREATE),
                 mock.call(plugin.floatingip_update_callback,
@@ -66,6 +94,8 @@ class TestBgpPlugin(base.BaseTestCase):
                           resources.ROUTER_GATEWAY, events.AFTER_CREATE),
                 mock.call(plugin.router_gateway_callback,
                           resources.ROUTER_GATEWAY, events.AFTER_DELETE),
+                mock.call(plugin.host_callback,
+                          n_resources.HOST, events.AFTER_UPDATE),
             ]
             self.assertEqual(subscribe.call_args_list, expected_calls)
 

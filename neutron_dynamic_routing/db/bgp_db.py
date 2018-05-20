@@ -14,8 +14,12 @@
 
 import itertools
 
+from datetime import datetime
+
 import netaddr
 
+from neutron.agent import fm
+from neutron.db import agents_db
 from neutron.db import api as db_api
 from neutron.db import common_db_mixin as common_db
 from neutron.db import l3_dvr_db
@@ -39,7 +43,11 @@ from sqlalchemy.orm import aliased
 from sqlalchemy.orm import exc as sa_exc
 
 from neutron_dynamic_routing._i18n import _
+from neutron_dynamic_routing.db import bgp_dragentscheduler_db as bgp_dras_db
+from neutron_dynamic_routing.db import bgpvpn_db
 from neutron_dynamic_routing.extensions import bgp as bgp_ext
+from neutron_dynamic_routing.services.bgp.common import constants
+from neutron_dynamic_routing.services.bgp.common import keystore
 
 
 DEVICE_OWNER_ROUTER_GW = lib_consts.DEVICE_OWNER_ROUTER_GW
@@ -89,7 +97,6 @@ class BgpSpeaker(model_base.BASEV2,
                  model_base.HasProject):
 
     """Represents a BGP speaker"""
-
     __tablename__ = 'bgp_speakers'
 
     name = sa.Column(sa.String(255), nullable=False)
@@ -105,6 +112,10 @@ class BgpSpeaker(model_base.BASEV2,
                                 cascade='all, delete, delete-orphan',
                                 lazy='joined')
     ip_version = sa.Column(sa.Integer, nullable=False, autoincrement=False)
+    vpns = orm.relationship(bgpvpn_db.BgpSpeakerVpnBinding,
+                            backref='bgp_speaker_vpn_bindings',
+                            cascade='all, delete, delete-orphan',
+                            lazy='joined')
 
 
 class BgpPeer(model_base.BASEV2,
@@ -121,9 +132,39 @@ class BgpPeer(model_base.BASEV2,
     remote_as = sa.Column(sa.Integer, nullable=False, autoincrement=False)
     auth_type = sa.Column(sa.String(16), nullable=False)
     password = sa.Column(sa.String(255), nullable=True)
+    hold_time = sa.Column(sa.Integer, nullable=False,
+                          default=constants.DEFAULT_HOLD_TIME)
 
 
-class BgpDbMixin(common_db.CommonDbMixin):
+class BgpDrAgentPeerState(model_base.BASEV2):
+
+    """Represents the connection state between a DR Agent and a peer"""
+
+    __tablename__ = 'bgp_dragent_peer_connectivity_states'
+
+    agent_id = sa.Column(sa.String(length=36),
+                         sa.ForeignKey('agents.id',
+                                       ondelete='CASCADE'),
+                         nullable=False,
+                         primary_key=True)
+    bgp_peer_id = sa.Column(sa.String(length=36),
+                            sa.ForeignKey('bgp_peers.id',
+                                          ondelete='CASCADE'),
+                            nullable=False,
+                            primary_key=True)
+    updated_at = sa.Column(sa.DateTime,
+                           nullable=False)
+    peer_connectivity_state = sa.Column(sa.String(length=16),
+                                        nullable=False)
+
+
+class BgpDbMixin(common_db.CommonDbMixin,
+                 agents_db.AgentDbMixin,
+                 fm.FmAgentMixin):
+
+    def __init__(self):
+        super(BgpDbMixin, self).__init__()
+        self.init_fm()
 
     def create_bgp_speaker(self, context, bgp_speaker):
         uuid = uuidutils.generate_uuid()
@@ -147,8 +188,9 @@ class BgpDbMixin(common_db.CommonDbMixin):
 
     def get_bgp_speaker_with_advertised_routes(self, context,
                                                bgp_speaker_id):
-        bgp_speaker_attrs = ['id', 'local_as', 'tenant_id']
-        bgp_peer_attrs = ['peer_ip', 'remote_as', 'password']
+        bgp_speaker_attrs = ['id', 'local_as', 'tenant_id', 'vpns']
+        bgp_peer_attrs = ['id', 'peer_ip', 'remote_as', 'auth_type',
+                          'password']
         with db_api.context_manager.reader.using(context):
             bgp_speaker = self.get_bgp_speaker(context, bgp_speaker_id,
                                                fields=bgp_speaker_attrs)
@@ -159,6 +201,9 @@ class BgpDbMixin(common_db.CommonDbMixin):
             res['advertised_routes'] = self.get_routes_by_bgp_speaker_id(
                                                                context,
                                                                bgp_speaker_id)
+            filters = {'id': bgp_speaker['vpns']}
+            res['bgpvpns'] = self.get_bgpvpns_rpc_info(
+                context, filters=filters)
             return res
 
     def update_bgp_speaker(self, context, bgp_speaker_id, bgp_speaker):
@@ -187,6 +232,7 @@ class BgpDbMixin(common_db.CommonDbMixin):
         self._save_bgp_speaker_peer_binding(context,
                                             bgp_speaker_id,
                                             bgp_peer_id)
+        self.create_bgp_dragent_peer_states_for_peer(context, bgp_peer_id)
         return {'bgp_peer_id': bgp_peer_id}
 
     def remove_bgp_peer(self, context, bgp_speaker_id, bgp_peer_info):
@@ -220,7 +266,9 @@ class BgpDbMixin(common_db.CommonDbMixin):
     def delete_bgp_speaker(self, context, bgp_speaker_id):
         with db_api.context_manager.writer.using(context):
             bgp_speaker_db = self._get_bgp_speaker(context, bgp_speaker_id)
+            bgp_speaker = self._make_bgp_speaker_dict(bgp_speaker_db)
             context.session.delete(bgp_speaker_db)
+            return bgp_speaker
 
     def create_bgp_peer(self, context, bgp_peer):
         ri = bgp_peer[bgp_ext.BGP_PEER_BODY_KEY_NAME]
@@ -231,13 +279,14 @@ class BgpDbMixin(common_db.CommonDbMixin):
 
         with db_api.context_manager.writer.using(context):
             res_keys = ['tenant_id', 'name', 'remote_as', 'peer_ip',
-                        'auth_type', 'password']
+                        'auth_type', 'password', 'hold_time']
             res = dict((k, ri[k]) for k in res_keys)
             res['id'] = uuidutils.generate_uuid()
+            password = res.pop('password')
             bgp_peer_db = BgpPeer(**res)
             context.session.add(bgp_peer_db)
             peer = self._make_bgp_peer_dict(bgp_peer_db)
-            peer.pop('password')
+            keystore.store_bgp_peer_password(res['id'], password)
             return peer
 
     def get_bgp_peers(self, context, fields=None, filters=None, sorts=None,
@@ -259,12 +308,17 @@ class BgpDbMixin(common_db.CommonDbMixin):
 
     def get_bgp_peer(self, context, bgp_peer_id, fields=None):
         bgp_peer_db = self._get_bgp_peer(context, bgp_peer_id)
-        return self._make_bgp_peer_dict(bgp_peer_db, fields=fields)
+        bgp_peer_dict = self._make_bgp_peer_dict(bgp_peer_db, fields=fields)
+        agent_connectivity = self.get_bgp_peer_states_for_dragents_dict(
+            context, bgp_peer_id)
+        bgp_peer_dict['agent_connectivity'] = str(agent_connectivity)
+        return bgp_peer_dict
 
     def delete_bgp_peer(self, context, bgp_peer_id):
         with db_api.context_manager.writer.using(context):
             bgp_peer_db = self._get_bgp_peer(context, bgp_peer_id)
             context.session.delete(bgp_peer_db)
+            keystore.delete_bgp_peer_password(bgp_peer_id)
 
     def update_bgp_peer(self, context, bgp_peer_id, bgp_peer):
         bp = bgp_peer[bgp_ext.BGP_PEER_BODY_KEY_NAME]
@@ -273,10 +327,130 @@ class BgpDbMixin(common_db.CommonDbMixin):
             if ((bp.get('password') is not None) and
                 (bgp_peer_db['auth_type'] == 'none')):
                 raise bgp_ext.BgpPeerNotAuthenticated(bgp_peer_id=bgp_peer_id)
+            password = bp.pop('password', None)
             bgp_peer_db.update(bp)
+            keystore.store_bgp_peer_password(bgp_peer_id, password)
 
         bgp_peer_dict = self._make_bgp_peer_dict(bgp_peer_db)
         return bgp_peer_dict
+
+    def create_or_update_bgp_dragent_peer_state(self, context, host,
+                                                remote_ip, remote_as,
+                                                peer_connectivity_state):
+        agent = self._get_agent_by_type_and_host(
+            context, constants.AGENT_TYPE_BGP_ROUTING, host)
+        agent_id = agent.id
+        filters = {'peer_ip': [remote_ip],
+                   'remote_as': [remote_as]}
+        bgp_peers = self.get_bgp_peers(context, filters=filters)
+
+        # Should only update state if exactly one matching bgp peer found
+        if len(bgp_peers) != 1:
+            return
+
+        bgp_peer_id = bgp_peers[0].get('id')
+        bgp_dragent_peer_state = self._get_bgp_dragent_peer_state(
+            context, agent_id, bgp_peer_id)
+        if bgp_dragent_peer_state:
+            self._update_bgp_dragent_peer_state(context, agent_id,
+                                                bgp_peer_id,
+                                                peer_connectivity_state)
+        else:
+            self._create_bgp_dragent_peer_state(context, agent_id,
+                                                bgp_peer_id,
+                                                peer_connectivity_state)
+
+    def _report_clear_bgp_connectivity_alarm(self, context,
+                                             agent_id, bgp_peer_id,
+                                             peer_connectivity_state):
+        host = self.get_agent(context, agent_id).get('host')
+        # Raise or clear alarms based on state
+        if peer_connectivity_state == constants.PEER_CONNECTIVITY_DOWN:
+            self.fm_driver.report_bgp_peer_down_fault(host,
+                                                      agent_id, bgp_peer_id)
+        elif peer_connectivity_state == constants.PEER_CONNECTIVITY_UP:
+            self.fm_driver.clear_bgp_peer_down_fault(host,
+                                                     agent_id, bgp_peer_id)
+
+    def _create_bgp_dragent_peer_state(self, context, agent_id,
+                                       bgp_peer_id,
+                                       peer_connectivity_state):
+        self._report_clear_bgp_connectivity_alarm(context,
+                                                  agent_id, bgp_peer_id,
+                                                  peer_connectivity_state)
+        with context.session.begin(subtransactions=True):
+            res = {'agent_id': agent_id,
+                   'bgp_peer_id': bgp_peer_id,
+                   'peer_connectivity_state': peer_connectivity_state,
+                   'updated_at': datetime.now()}
+            bgp_dragent_peer_state = BgpDrAgentPeerState(**res)
+            context.session.add(bgp_dragent_peer_state)
+            return bgp_dragent_peer_state
+
+    def _update_bgp_dragent_peer_state(self, context, agent_id,
+                                       bgp_peer_id,
+                                       peer_connectivity_state):
+        self._report_clear_bgp_connectivity_alarm(context,
+                                                  agent_id, bgp_peer_id,
+                                                  peer_connectivity_state)
+        with context.session.begin(subtransactions=True):
+            res = {'agent_id': agent_id,
+                   'bgp_peer_id': bgp_peer_id,
+                   'peer_connectivity_state': peer_connectivity_state,
+                   'updated_at': datetime.now()}
+            bgp_dragent_peer_state = self._get_bgp_dragent_peer_state(
+                context, agent_id, bgp_peer_id)
+            bgp_dragent_peer_state.update(res)
+            return bgp_dragent_peer_state
+
+    def _get_bgp_dragent_peer_state(self, context, agent_id, bgp_peer_id):
+        with context.session.begin(subtransactions=True):
+            query = context.session.query(BgpDrAgentPeerState)
+            query = query.filter(
+                BgpDrAgentPeerState.agent_id == agent_id,
+                BgpDrAgentPeerState.bgp_peer_id == bgp_peer_id)
+            bgp_dragent_peer_state = query.one_or_none()
+            return bgp_dragent_peer_state
+
+    def get_bgp_peer_states_for_dragents(self, context, bgp_peer_id):
+        with context.session.begin(subtransactions=True):
+            query = context.session.query(BgpDrAgentPeerState)
+            query = query.filter(
+                BgpDrAgentPeerState.bgp_peer_id == bgp_peer_id)
+            bgp_dragent_peer_states = query.all()
+            return bgp_dragent_peer_states
+
+    def get_bgp_peer_states_for_dragents_dict(self, context, bgp_peer_id):
+        states = self.get_bgp_peer_states_for_dragents(context, bgp_peer_id)
+        return {s.agent_id: s.peer_connectivity_state for s in states}
+
+    def create_bgp_dragent_peer_states_for_peer(self, context, bgp_peer_id):
+        with context.session.begin(subtransactions=True):
+            query = context.session.query(bgp_dras_db.BgpSpeakerDrAgentBinding,
+                                          BgpSpeakerPeerBinding)\
+                    .join(BgpSpeakerPeerBinding,
+                          BgpSpeakerPeerBinding.bgp_speaker_id ==
+                          bgp_dras_db.BgpSpeakerDrAgentBinding.bgp_speaker_id)\
+                    .filter(BgpSpeakerPeerBinding.bgp_peer_id == bgp_peer_id)
+        for result in query.all():
+            agent_id = result[0].agent_id
+            if not self._get_bgp_dragent_peer_state(context, agent_id,
+                                                    bgp_peer_id):
+                self._create_bgp_dragent_peer_state(context, agent_id,
+                    bgp_peer_id, constants.PEER_CONNECTIVITY_DOWN)
+
+    def create_bgp_dragent_peer_states_for_agent(self, context, agent_id,
+                                                 bgp_speaker_id):
+        with context.session.begin(subtransactions=True):
+            query = context.session.query(BgpSpeakerPeerBinding)\
+                    .filter(BgpSpeakerPeerBinding.bgp_speaker_id ==
+                            bgp_speaker_id)
+        for result in query.all():
+            bgp_peer_id = result.bgp_peer_id
+            if not self._get_bgp_dragent_peer_state(context, agent_id,
+                                                    bgp_peer_id):
+                self._create_bgp_dragent_peer_state(context, agent_id,
+                    bgp_peer_id, constants.PEER_CONNECTIVITY_DOWN)
 
     def _get_bgp_speaker(self, context, bgp_speaker_id):
         try:
@@ -417,9 +591,11 @@ class BgpDbMixin(common_db.CommonDbMixin):
                  'advertise_tenant_networks'}
         peer_bindings = bgp_speaker['peers']
         network_bindings = bgp_speaker['networks']
+        vpn_bindings = bgp_speaker['vpns']
         res = dict((k, bgp_speaker[k]) for k in attrs)
         res['peers'] = [x.bgp_peer_id for x in peer_bindings]
         res['networks'] = [x.network_id for x in network_bindings]
+        res['vpns'] = [x.bgpvpn_id for x in vpn_bindings]
         return self._fields(res, fields)
 
     def _make_advertised_routes_dict(self, routes):
@@ -447,7 +623,7 @@ class BgpDbMixin(common_db.CommonDbMixin):
 
     def _make_bgp_peer_dict(self, bgp_peer, fields=None):
         attrs = ['tenant_id', 'id', 'name', 'peer_ip', 'remote_as',
-                 'auth_type', 'password']
+                 'auth_type', 'password', 'hold_time']
         res = dict((k, bgp_peer[k]) for k in attrs)
         return self._fields(res, fields)
 

@@ -25,3 +25,10 @@ SUPPORTED_AUTH_TYPES = ['none', 'md5']
 # Supported AS number range
 MIN_ASNUM = 1
 MAX_ASNUM = 65535
+
+# Connectivty states from dynamic-routing agent to peers
+PEER_CONNECTIVITY_UP = 'UP'
+PEER_CONNECTIVITY_DOWN = 'DOWN'
+
+# Controls the default hold time if not specified at the API (in seconds)
+DEFAULT_HOLD_TIME = 30

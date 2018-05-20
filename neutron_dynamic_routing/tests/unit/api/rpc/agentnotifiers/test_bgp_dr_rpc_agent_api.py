@@ -82,3 +82,49 @@ class TestBgpDrAgentNotifyApi(base.BaseTestCase):
                                           self.host)
         self.assertEqual(1, self.mock_cast.call_count)
         self.assertEqual(0, self.mock_call.call_count)
+
+    def test_notify_bgp_speaker_vpn_associated(self):
+        bgpvpn_dict = {'id': 'id1',
+                       'type': 'l3',
+                       'name': 'bgpvpn1',
+                       'rd': '100:100',
+                       'import_rt': '100:100',
+                       'export_rt': '100:100',
+                       'vni': 1000}
+        bgp_speaker_id = 'bgp-speaker-1'
+        self.notifier.bgp_speaker_vpn_associated(self.context, bgp_speaker_id,
+            bgpvpn_dict, self.host)
+        self.assertEqual(1, self.mock_cast.call_count)
+        self.assertEqual(0, self.mock_call.call_count)
+
+    def test_notify_bgp_speaker_vpn_disassociated(self):
+        bgpvpn_dict = {'id': 'id1',
+                       'type': 'l3',
+                       'name': 'bgpvpn1',
+                       'rd': '100:100',
+                       'import_rt': '100:100',
+                       'export_rt': '100:100',
+                       'vni': 1000}
+        bgp_speaker_id = 'bgp-speaker-1'
+        self.notifier.bgp_speaker_vpn_disassociated(self.context,
+            bgp_speaker_id, bgpvpn_dict, self.host)
+        self.assertEqual(1, self.mock_cast.call_count)
+        self.assertEqual(0, self.mock_call.call_count)
+
+    def test_notify_bgpvpn_routes_advertisement(self):
+        bgp_speaker_id = 'bgp-speaker-1'
+        bgpvpn_id = 'bgpvpn-id-1'
+        routes = {'prefix': ['192.168.1.0/24'], 'next_hop': '1.1.1.1'}
+        self.notifier.bgpvpn_routes_advertisement(self.context, bgp_speaker_id,
+            bgpvpn_id, routes, self.host)
+        self.assertEqual(1, self.mock_cast.call_count)
+        self.assertEqual(0, self.mock_call.call_count)
+
+    def test_notify_bgpvpn_routes_withdrawal(self):
+        bgp_speaker_id = 'bgp-speaker-1'
+        bgpvpn_id = 'bgpvpn-id-1'
+        routes = {'prefix': ['192.168.1.0/24'], 'next_hop': '1.1.1.1'}
+        self.notifier.bgpvpn_routes_withdrawal(self.context, bgp_speaker_id,
+            bgpvpn_id, routes, self.host)
+        self.assertEqual(1, self.mock_cast.call_count)
+        self.assertEqual(0, self.mock_call.call_count)

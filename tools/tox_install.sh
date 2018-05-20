@@ -10,7 +10,8 @@
 
 ZUUL_CLONER=/usr/zuul-env/bin/zuul-cloner
 neutron_installed=$(echo "import neutron" | python 2>/dev/null ; echo $?)
-BRANCH_NAME=master
+bgpvpn_installed=$(echo "import networking_bgpvpn" | python 2>/dev/null ; echo $?)
+BRANCH_NAME=stable/pike
 
 set -e
 
@@ -40,6 +41,27 @@ elif [ -x "$ZUUL_CLONER" ]; then
 else
     echo "PIP HARDCODE" > /tmp/tox_install.txt
     $install_cmd -U -egit+https://git.openstack.org/openstack/neutron@$BRANCH_NAME#egg=neutron
+fi
+
+# install networking-bgpvpn project
+if [ $bgpvpn_installed -eq 0 ]; then
+    echo "ALREADY INSTALLED" > /tmp/tox_install.txt
+    echo "BGPVPN already installed; using existing package"
+elif [ -x "$ZUUL_CLONER" ]; then
+    echo "ZUUL CLONER" > /tmp/tox_install.txt
+    cwd=$(/bin/pwd)
+    cd /tmp
+    $ZUUL_CLONER --cache-dir \
+        /opt/git \
+        --branch $BRANCH_NAME \
+        git://git.openstack.org \
+        openstack/networking-bgpvpn
+    cd openstack/networking-bgpvpn
+    $install_cmd -e .
+    cd "$cwd"
+else
+    echo "PIP HARDCODE" > /tmp/tox_install.txt
+    $install_cmd -U -egit+https://git.openstack.org/openstack/networking-bgpvpn@$BRANCH_NAME#egg=networking-bgpvpn
 fi
 
 $install_cmd -U $*

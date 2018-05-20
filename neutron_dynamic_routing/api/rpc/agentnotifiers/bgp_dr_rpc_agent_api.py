@@ -34,6 +34,11 @@ class BgpDrAgentNotifyApi(object):
         self.client = n_rpc.get_client(target)
         self.topic = topic
 
+    def agent_updated(self, context, admin_state_up, host):
+        """Tell BgpDrAgent that the agent admin state has changed."""
+        self._notification_host_cast(context, 'agent_updated',
+                                     {'admin_state_up': admin_state_up}, host)
+
     def bgp_routes_advertisement(self, context, bgp_speaker_id,
                                  routes, host):
         """Tell BgpDrAgent to begin advertising the given route.
@@ -95,6 +100,51 @@ class BgpDrAgentNotifyApi(object):
         """
         self._notification_host_cast(context, 'bgp_speaker_remove_end',
                 {'bgp_speaker': {'id': bgp_speaker_id}}, host)
+
+    def bgp_speaker_vpn_associated(self, context, bgp_speaker_id,
+                                   bgpvpn, host):
+        """Tell BgpDrAgent about a new bgpvpn association with the speaker.
+
+        This effectively tells the bgp_dragent to create a new bgpvpn.
+        """
+        self._notification_host_cast(context, 'bgp_speaker_vpn_associated',
+                {'bgpvpn': {'speaker_id': bgp_speaker_id,
+                            'bgpvpn': bgpvpn}}, host)
+
+    def bgp_speaker_vpn_disassociated(self, context, bgp_speaker_id,
+                                    bgpvpn_id, host):
+        """Tell BgpDrAgent about a new bgpvpn disassociation with the speaker.
+
+        This effectively tells the bgp_dragent to remove a bgpvpn.
+        """
+        self._notification_host_cast(context, 'bgp_speaker_vpn_disassociated',
+                {'bgpvpn': {'speaker_id': bgp_speaker_id,
+                            'bgpvpn_id': bgpvpn_id}}, host)
+
+    def bgpvpn_routes_advertisement(self, context, bgp_speaker_id, bgpvpn_id,
+                                 routes, host):
+        """Tell BgpDrAgent to begin advertising the given route in vpn.
+
+        Invoked on VM port up event, adding router port to a tenant network,
+        subnet address scope change.
+        """
+        self._notification_host_cast(context,
+                'bgpvpn_routes_advertisement_end',
+                {'advertise_routes': {'speaker_id': bgp_speaker_id,
+                                      'bgpvpn_id': bgpvpn_id,
+                                      'routes': routes}}, host)
+
+    def bgpvpn_routes_withdrawal(self, context, bgp_speaker_id, bgpvpn_id,
+                              routes, host):
+        """Tell BgpDrAgent to stop withdraw the given route.
+
+        Invoked on VM deletion, VM port down, removal of a router port on a
+        network, and subnet address scope change.
+        """
+        self._notification_host_cast(context, 'bgpvpn_routes_withdrawal_end',
+                {'withdraw_routes': {'speaker_id': bgp_speaker_id,
+                                     'bgpvpn_id': bgpvpn_id,
+                                     'routes': routes}}, host)
 
     def _notification_host_cast(self, context, method, payload, host):
         """Send payload to BgpDrAgent in the cast mode"""

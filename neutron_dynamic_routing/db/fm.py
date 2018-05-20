@@ -1,3 +1,6 @@
+# Copyright (c) 2014 OpenStack Foundation
+# All Rights Reserved.
+#
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
 #    a copy of the License at
@@ -9,6 +12,14 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2017 Wind River Systems, Inc.
+#
 
-BGP_SPEAKER = 'bgp_speaker'
-BGP_SPEAKER_VPN_ASSOC = 'bgp_speaker_vpn_assoc'
+
+class FmAgentMixin(object):
+    """
+    Stub to allow tox tests to pass
+    """
+    def init_fm(self, *args, **kwargs):
+        pass

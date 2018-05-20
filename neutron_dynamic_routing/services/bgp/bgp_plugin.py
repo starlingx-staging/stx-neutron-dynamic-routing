@@ -19,12 +19,15 @@ from neutron_lib.callbacks import registry
 from neutron_lib.callbacks import resources
 from neutron_lib import constants as n_const
 from neutron_lib import context
+from neutron_lib.plugins import directory
 from neutron_lib.services import base as service_base
 from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_utils import importutils
 
+from neutron.callbacks import resources as n_resources
 from neutron.common import rpc as n_rpc
+from neutron.extensions import agent as ext_agent
 
 from neutron_dynamic_routing.api.rpc.agentnotifiers import bgp_dr_rpc_agent_api  # noqa
 from neutron_dynamic_routing.api.rpc.callbacks import resources as dr_resources
@@ -33,6 +36,7 @@ from neutron_dynamic_routing.db import bgp_db
 from neutron_dynamic_routing.db import bgp_dragentscheduler_db
 from neutron_dynamic_routing.extensions import bgp as bgp_ext
 from neutron_dynamic_routing.extensions import bgp_dragentscheduler as dras_ext
+from neutron_dynamic_routing.services.bgp import bgpvpn_plugin
 from neutron_dynamic_routing.services.bgp.common import constants as bgp_consts
 
 PLUGIN_NAME = bgp_ext.BGP_EXT_ALIAS + '_svc_plugin'
@@ -41,7 +45,8 @@ LOG = logging.getLogger(__name__)
 
 class BgpPlugin(service_base.ServicePluginBase,
                 bgp_db.BgpDbMixin,
-                bgp_dragentscheduler_db.BgpDrAgentSchedulerDbMixin):
+                bgp_dragentscheduler_db.BgpDrAgentSchedulerDbMixin,
+                bgpvpn_plugin.BGPVPNBase):
 
     supported_extension_aliases = [bgp_ext.BGP_EXT_ALIAS,
                                    dras_ext.BGP_DRAGENT_SCHEDULER_EXT_ALIAS]
@@ -50,6 +55,7 @@ class BgpPlugin(service_base.ServicePluginBase,
         super(BgpPlugin, self).__init__()
         self.bgp_drscheduler = importutils.import_object(
             cfg.CONF.bgp_drscheduler_driver)
+        self._core_plugin = None
         self._setup_rpc()
         self._register_callbacks()
 
@@ -63,6 +69,12 @@ class BgpPlugin(service_base.ServicePluginBase,
         """returns string description of the plugin."""
         return ("BGP dynamic routing service for announcement of next-hops "
                 "for project networks, floating IP's, and DVR host routes.")
+
+    @property
+    def core_plugin(self):
+        if not self._core_plugin:
+            self._core_plugin = directory.get_plugin()
+        return self._core_plugin
 
     def _setup_rpc(self):
         self.topic = bgp_consts.BGP_PLUGIN
@@ -95,6 +107,8 @@ class BgpPlugin(service_base.ServicePluginBase,
         registry.subscribe(self.router_gateway_callback,
                            resources.ROUTER_GATEWAY,
                            events.AFTER_DELETE)
+        registry.subscribe(self.host_callback,
+                           n_resources.HOST, events.AFTER_UPDATE)
 
     def get_bgp_speakers(self, context, filters=None, fields=None,
                          sorts=None, limit=None, marker=None,
@@ -131,11 +145,16 @@ class BgpPlugin(service_base.ServicePluginBase,
         hosted_bgp_dragents = self.get_dragents_hosting_bgp_speakers(
                                                              context,
                                                              [bgp_speaker_id])
-        super(BgpPlugin, self).delete_bgp_speaker(context, bgp_speaker_id)
+        bgp_speaker = super(BgpPlugin, self).delete_bgp_speaker(
+            context, bgp_speaker_id)
         for agent in hosted_bgp_dragents:
             self._bgp_rpc.bgp_speaker_removed(context,
                                               bgp_speaker_id,
                                               agent.host)
+        payload = {'plugin': self, 'context': context,
+                   'bgp_speaker': bgp_speaker}
+        registry.notify(dr_resources.BGP_SPEAKER, events.AFTER_DELETE,
+                        self, payload=payload)
 
     def get_bgp_peers(self, context, fields=None, filters=None, sorts=None,
                       limit=None, marker=None, page_reverse=False):
@@ -192,6 +211,8 @@ class BgpPlugin(service_base.ServicePluginBase,
         super(BgpPlugin, self).add_bgp_speaker_to_dragent(context,
                                                           agent_id,
                                                           speaker_id)
+        super(BgpPlugin, self).create_bgp_dragent_peer_states_for_agent(
+            context, agent_id, speaker_id)
 
     def remove_bgp_speaker_from_dragent(self, context, agent_id, speaker_id):
         super(BgpPlugin, self).remove_bgp_speaker_from_dragent(context,
@@ -379,3 +400,20 @@ class BgpPlugin(service_base.ServicePluginBase,
         if LOG.isEnabledFor(logging.DEBUG):
             for route in routes:
                 LOG.debug(msg, route, bgp_speaker_id)
+
+    def host_callback(self, resource, event, trigger, **kwargs):
+        """Handle host notifications and relay to the agents.
+
+        Since host notifications only go to L2 agents we need to poke our
+        agent to resync in order for its local data to reflect the current
+        scheduling state.
+        """
+        context = kwargs.get('context')
+        host = kwargs.get('host')
+        try:
+            agent = self._get_agent_by_type_and_host(
+                context, bgp_consts.AGENT_TYPE_BGP_ROUTING, host['name'])
+            admin_state_up = agent['admin_state_up']
+            self._bgp_rpc.agent_updated(context, admin_state_up, host['name'])
+        except ext_agent.AgentNotFoundByTypeHost:
+            return

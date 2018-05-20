@@ -198,13 +198,17 @@ class TestBgpAgentFilter(TestBgpDrAgentSchedulerBaseTestCase,
         expected_filtered_dragent_ids = [agent.id for agent in agents]
         self._test_filter_agents_helper(
             self.bgp_speaker,
-            expected_filtered_dragent_ids=expected_filtered_dragent_ids)
+            expected_filtered_dragent_ids=expected_filtered_dragent_ids,
+            expected_num_agents=2)
 
     def test_filter_agents_agent_already_scheduled(self):
         agents = self._create_and_set_agents_down(['host-a', 'host-b'])
         self._test_schedule_bind_bgp_speaker([agents[0]], self.bgp_speaker_id)
-        self._test_filter_agents_helper(self.bgp_speaker,
-                                        expected_num_agents=0)
+        expected_filtered_dragent_ids = [agents[1].id]
+        self._test_filter_agents_helper(
+            self.bgp_speaker,
+            expected_filtered_dragent_ids=expected_filtered_dragent_ids,
+            expected_num_agents=1)
 
     def test_filter_agents_multiple_agents_bgp_speakers(self):
         agents = self._create_and_set_agents_down(['host-a', 'host-b'])

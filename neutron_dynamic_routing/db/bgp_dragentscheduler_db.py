@@ -193,7 +193,11 @@ class BgpDrAgentSchedulerDbMixin(bgp_dras_ext.BgpDrSchedulerPluginBase,
             context, bgp_consts.AGENT_TYPE_BGP_ROUTING, host)
         if not agent.admin_state_up:
             return {}
-
+        if not self.core_plugin.is_host_available(context, host):
+            return {}
+        if self.bgp_drscheduler:
+            self.bgp_drscheduler.schedule_unscheduled_bgp_speakers(
+                context, host)
         query = context.session.query(BgpSpeakerDrAgentBinding)
         query = query.filter(BgpSpeakerDrAgentBinding.agent_id == agent.id)
         try:

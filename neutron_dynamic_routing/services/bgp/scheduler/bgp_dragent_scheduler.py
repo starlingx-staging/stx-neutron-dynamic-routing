@@ -18,6 +18,7 @@ from neutron_lib.callbacks import registry
 from neutron_lib import context as nl_context
 from oslo_db import exception as db_exc
 from oslo_log import log as logging
+from sqlalchemy import func
 from sqlalchemy.orm import exc
 from sqlalchemy import sql
 
@@ -33,7 +34,7 @@ from neutron_dynamic_routing.db import bgp_dragentscheduler_db as bgp_dras_db
 from neutron_dynamic_routing.services.bgp.common import constants as bgp_consts
 
 LOG = logging.getLogger(__name__)
-BGP_SPEAKER_PER_DRAGENT = 1
+BGP_DRAGENT_PER_SPEAKER = 2  # Ensure speakers are bound to both controllers
 
 
 class BgpDrAgentFilter(base_resource_filter.BaseResourceFilter):
@@ -93,8 +94,7 @@ class BgpDrAgentFilter(base_resource_filter.BaseResourceFilter):
            the given BgpSpeaker and a list of BgpDrAgents which can host the
            given BgpSpeaker
         """
-        # only one BgpSpeaker can be hosted by a BgpDrAgent for now.
-        dragents_per_bgp_speaker = BGP_SPEAKER_PER_DRAGENT
+        dragents_per_bgp_speaker = BGP_DRAGENT_PER_SPEAKER
         dragent_bindings = plugin.get_dragent_bgp_speaker_bindings(context)
         agents_hosting = [dragent_binding.agent_id
                           for dragent_binding in dragent_bindings]
@@ -109,6 +109,7 @@ class BgpDrAgentFilter(base_resource_filter.BaseResourceFilter):
                     'hosted_agents': []}
 
         active_dragents = self._get_active_dragents(plugin, context)
+        # only one BgpSpeaker can be hosted by a BgpDrAgent for now.
         hostable_dragents = [
             agent for agent in set(active_dragents)
             if agent.id not in agents_hosting and plugin.is_eligible_agent(
@@ -177,14 +178,20 @@ class BgpDrAgentSchedulerBase(BgpDrAgentFilter):
         return query.count() > 0
 
     def _get_unscheduled_bgp_speakers(self, context):
-        """BGP speakers that needs to be scheduled.
+        """BGP speakers that needs to be scheduled while respecting the
+        number of agents that must host a speaker for it to be properly
+        serviced.
         """
-
-        no_agent_binding = ~sql.exists().where(
-            bgp_db.BgpSpeaker.id ==
-            bgp_dras_db.BgpSpeakerDrAgentBinding.bgp_speaker_id)
-        query = context.session.query(bgp_db.BgpSpeaker.id).filter(
-            no_agent_binding)
+        query = (context.session.query(
+            bgp_db.BgpSpeaker.id,
+            func.count(bgp_dras_db.BgpSpeakerDrAgentBinding.agent_id)).
+            select_from(bgp_db.BgpSpeaker).
+            outerjoin(bgp_dras_db.BgpSpeakerDrAgentBinding,
+                      bgp_dras_db.BgpSpeakerDrAgentBinding.bgp_speaker_id ==
+                      bgp_db.BgpSpeaker.id).
+            group_by(bgp_db.BgpSpeaker.id).
+            having(func.count(bgp_dras_db.BgpSpeakerDrAgentBinding.agent_id)
+                   < BGP_DRAGENT_PER_SPEAKER))
         return [bgp_speaker_id_[0] for bgp_speaker_id_ in query]
 
     def schedule_bgp_speaker_callback(self, resource, event, trigger, payload):

@@ -15,6 +15,9 @@
 
 import collections
 
+import netaddr
+import six
+
 from neutron_lib import context
 from neutron_lib.utils import runtime
 from oslo_config import cfg
@@ -24,17 +27,25 @@ from oslo_service import loopingcall
 from oslo_service import periodic_task
 from oslo_utils import importutils
 
+from neutron_lib import constants
+
+from networking_bgpvpn.neutron.api import rpc as bgpvpn_rpc
+from networking_bgpvpn.neutron.services.common import constants as bgpvpn_constants  # noqa
+
 from neutron.agent import rpc as agent_rpc
 from neutron.common import constants as n_const
 from neutron.common import rpc as n_rpc
 from neutron.common import topics
 from neutron.common import utils
 from neutron import manager
+from neutron.notifiers import batch_notifier
+from neutron.plugins.ml2.drivers.l2pop.rpc_manager import l2population_rpc
 
 from neutron_dynamic_routing.extensions import bgp as bgp_ext
 from neutron_dynamic_routing._i18n import _, _LE, _LI, _LW
 from neutron_dynamic_routing.services.bgp.agent.driver import exceptions as driver_exc  # noqa
 from neutron_dynamic_routing.services.bgp.common import constants as bgp_consts  # noqa
+from neutron_dynamic_routing.services.bgp.common import keystore
 
 LOG = logging.getLogger(__name__)
 
@@ -56,7 +67,6 @@ class BgpDrAgent(manager.Manager):
 
     def __init__(self, host, conf=None):
         super(BgpDrAgent, self).__init__()
-        self.initialize_driver(conf)
         self.needs_resync_reasons = collections.defaultdict(list)
         self.needs_full_sync_reason = None
 
@@ -64,13 +74,52 @@ class BgpDrAgent(manager.Manager):
         self.context = context.get_admin_context_without_session()
         self.plugin_rpc = BgpDrPluginApi(bgp_consts.BGP_PLUGIN,
                                          self.context, host)
+        self.host = host
+        self.initialize_driver(conf)
+        self.bgpvpn_rpc = bgpvpn_rpc.BGPVPNRpcApi(bgpvpn_constants.BGPVPN,
+                                                  self.context, host)
+        self.bgpvpn_notifier = BgpBatchedEventNotifier(self)
+
+    @utils.synchronized('bgp-dr-agent')
+    def peer_up_callback(self, remote_ip, remote_as, **kwargs):
+        peer_state = bgp_consts.PEER_CONNECTIVITY_UP
+        self.plugin_rpc.update_bgp_dragent_peer_state(self.context, self.host,
+                                                      remote_ip, remote_as,
+                                                      peer_state)
+
+    @utils.synchronized('bgp-dr-agent')
+    def peer_down_callback(self, remote_ip, remote_as, **kwargs):
+        peer_state = bgp_consts.PEER_CONNECTIVITY_DOWN
+        self.plugin_rpc.update_bgp_dragent_peer_state(self.context, self.host,
+                                                      remote_ip, remote_as,
+                                                      peer_state)
+
+    @utils.synchronized('bgp-dr-agent')
+    def path_change_callback(self, route_type, **kwargs):
+        if route_type not in bgpvpn_constants.BGPEVPN_SUPPORTED_ROUTE_TYPES:
+            LOG.warning(_LW("Unsupported route type {} from driver").format(
+                route_type))
+            return
+        vni = kwargs['vni']
+        bgpvpn = self.cache.get_bgpvpn_by_vni(vni)
+        if not bgpvpn:
+            LOG.debug("Ignoring path event on unknown VNI {}: {}".format(
+                vni, kwargs))
+            return
+        kwargs['route_type'] = route_type
+        kwargs['bgpvpn_id'] = bgpvpn['id']
+        self.bgpvpn_notifier.queue_event(kwargs)
 
     def initialize_driver(self, conf):
         self.conf = conf or cfg.CONF.BGP
         try:
+            kwargs = {'peer_up_callback': self.peer_up_callback,
+                      'peer_down_callback': self.peer_down_callback,
+                      'path_change_callback': self.path_change_callback}
+
             self.dr_driver_cls = (
                     importutils.import_object(self.conf.bgp_speaker_driver,
-                                              self.conf))
+                                              self.conf, **kwargs))
         except ImportError:
             LOG.exception(_LE("Error while importing BGP speaker driver %s"),
                           self.conf.bgp_speaker_driver)
@@ -123,6 +172,23 @@ class BgpDrAgent(manager.Manager):
             self.schedule_full_resync(reason=e)
             LOG.error(_LE('Unable to sync BGP speaker state.'))
 
+    def sync_bgp_speaker_bgpvpns(self, bgp_speaker):
+        # NOTE(alegacy): Only consider bgpvpns that have at least one
+        # network or router associated; otherwise there is no point in
+        # receiving anything from the peer.
+        bgpvpn_ids = set([v['id'] for v in bgp_speaker['bgpvpns']
+                          if v['networks'] or v['routers']])
+        cached_bgpvpn_ids = set(self.cache.get_bgpvpn_ids(bgp_speaker['id']))
+
+        removed_bgpvpn_ids = cached_bgpvpn_ids - bgpvpn_ids
+        for bgpvpn_id in removed_bgpvpn_ids:
+            self.remove_bgpvpn_from_speaker(bgp_speaker['id'], bgpvpn_id)
+
+        added_bgpvpn_ids = bgpvpn_ids - cached_bgpvpn_ids
+        for bgpvpn in bgp_speaker['bgpvpns']:
+            if bgpvpn['id'] in added_bgpvpn_ids:
+                self.add_bgpvpn_to_speaker(bgp_speaker['id'], bgpvpn)
+
     def sync_bgp_speaker(self, bgp_speaker):
         # sync BGP Speakers
         bgp_peer_ips = set(
@@ -150,6 +216,9 @@ class BgpDrAgent(manager.Manager):
                                                     cached_route)
 
         self.advertise_routes_via_bgp_speaker(bgp_speaker)
+
+        # sync vpns
+        self.sync_bgp_speaker_bgpvpns(bgp_speaker)
 
     @utils.exception_logger()
     def _periodic_resync_helper(self, context):
@@ -357,6 +426,13 @@ class BgpDrAgent(manager.Manager):
 
         # Add peer and route information to the driver.
         self.add_bgp_peers_to_bgp_speaker(bgp_speaker)
+        for bgpvpn in bgp_speaker['bgpvpns']:
+            if not bgpvpn['networks'] and not bgpvpn['routers']:
+                # NOTE(alegacy): Only consider bgpvpns that have at least one
+                # network or router associated; otherwise there is no point in
+                # receiving anything from the far end.
+                continue
+            self.add_bgpvpn_to_speaker(bgp_speaker['id'], bgpvpn)
         self.advertise_routes_via_bgp_speaker(bgp_speaker)
         self.schedule_resync(speaker_id=bgp_speaker['id'],
                              reason="Periodic route cache refresh")
@@ -405,11 +481,16 @@ class BgpDrAgent(manager.Manager):
                    'remote_as': bgp_peer['remote_as'],
                    'local_as': bgp_speaker_as})
         try:
+            password = keystore.get_bgp_peer_password(bgp_peer['id'])
+            hold_time = bgp_peer.get('hold_time')
             self.dr_driver_cls.add_bgp_peer(bgp_speaker_as,
                                             bgp_peer['peer_ip'],
                                             bgp_peer['remote_as'],
                                             bgp_peer['auth_type'],
-                                            bgp_peer['password'])
+                                            password,
+                                            enable_evpn=True,
+                                            hold_time=hold_time,
+                                            connect_mode='both')
         except Exception as e:
             self._handle_driver_failure(bgp_speaker_id,
                                         'add_bgp_peer', e)
@@ -523,6 +604,112 @@ class BgpDrAgent(manager.Manager):
                   'with reason=%s', bgp_speaker_id, reason)
         return True
 
+    @staticmethod
+    def _get_route_dist(bgp_speaker_as, bgpvpn):
+        """Determine what to use for a route distinguisher value.
+
+        The data passed down from the server bgpvpn plugin includes a route
+        distinguisher value but it is optional and when present is formatted
+        as a list.  The driver API requires a single RD value so either use
+        the first value from the RD list provided by the server or build one
+        based on the AS and the VNI value.
+        """
+        route_dist = bgpvpn.get('rd')
+        if not route_dist:
+            route_dist = ["%s:%d" % (bgp_speaker_as, bgpvpn['vni'])]
+        return str(route_dist[0])
+
+    def add_bgpvpn_to_speaker(self, bgp_speaker_id, bgpvpn):
+        if not self.cache.is_bgp_speaker_added(bgp_speaker_id):
+            self.schedule_resync(speaker_id=bgp_speaker_id,
+                                 reason="BGP Speaker Out-of-sync")
+            return
+
+        bgp_speaker_as = self.cache.get_bgp_speaker_local_as(bgp_speaker_id)
+        route_dist = self._get_route_dist(bgp_speaker_as, bgpvpn)
+
+        LOG.debug('Calling driver interface for adding %(type)s VRF %(rd)s '
+                  'for import_rt %(import_rt)s and export_rt %(export_rt)s '
+                  'to BGP Speaker running for local_as=%(local_as)d',
+                  {'rd': route_dist,
+                   'type': bgpvpn['type'],
+                   'import_rt': bgpvpn['import_rt'],
+                   'export_rt': bgpvpn['export_rt'],
+                   'local_as': bgp_speaker_as})
+
+        try:
+            self.dr_driver_cls.add_vrf(bgp_speaker_as, route_dist,
+                                       [str(r) for r in bgpvpn['import_rt']],
+                                       [str(r) for r in bgpvpn['export_rt']],
+                                       str(bgpvpn['type']))
+            self.cache.put_bgpvpn(bgp_speaker_id, bgpvpn)
+            return True
+        except Exception as e:
+            self._handle_driver_failure(bgp_speaker_id, 'add_vrf', e)
+
+    def remove_bgpvpn_from_speaker(self, bgp_speaker_id, bgpvpn_id):
+        if not self.cache.is_bgp_speaker_added(bgp_speaker_id):
+            self.schedule_resync(speaker_id=bgp_speaker_id,
+                                 reason="BGP Speaker Out-of-sync")
+            return
+
+        bgpvpn = self.cache.get_bgpvpn_by_id(bgp_speaker_id, bgpvpn_id)
+        if not bgpvpn:
+            self.schedule_resync(speaker_id=bgp_speaker_id,
+                                 reason="VPN not present on BGP Speaker")
+            return
+
+        bgp_speaker_as = self.cache.get_bgp_speaker_local_as(bgp_speaker_id)
+        route_dist = self._get_route_dist(bgp_speaker_as, bgpvpn)
+
+        self.cache.remove_bgpvpn_by_id(bgp_speaker_id, bgpvpn_id)
+
+        LOG.debug('Calling driver interface for removing %(type)s VRF %(rd)s '
+                  'for import_rt %(import_rt)s and export_rt %(export_rt)s '
+                  'from BGP Speaker running for local_as=%(local_as)d',
+                  {'rd': route_dist,
+                   'type': bgpvpn['type'],
+                   'import_rt': bgpvpn['import_rt'],
+                   'export_rt': bgpvpn['export_rt'],
+                   'local_as': bgp_speaker_as})
+        try:
+            self.dr_driver_cls.delete_vrf(bgp_speaker_as, route_dist)
+        except Exception as e:
+            self._handle_driver_failure(bgp_speaker_id, 'delete_vrf', e)
+
+    @utils.synchronized('bgp-dr-agent')
+    def bgp_speaker_vpn_associated(self, context, payload):
+        """Handle bgp_speaker_vpn_associated notification event."""
+        bgpvpn = payload['bgpvpn']
+        bgp_speaker_id = bgpvpn['speaker_id']
+
+        LOG.debug('Received BGP VPN association notification for '
+                  'speaker_id=%(speaker_id)s bgpvpn=%(bgpvpn)s from the '
+                  'neutron server.',
+                  {'speaker_id': bgp_speaker_id,
+                   'bgpvpn': bgpvpn['bgpvpn']})
+        self.add_bgpvpn_to_speaker(bgp_speaker_id, bgpvpn['bgpvpn'])
+
+    @utils.synchronized('bgp-dr-agent')
+    def bgp_speaker_vpn_disassociated(self, context, payload):
+        """Handle bgp_speaker_vpn_associated notification event."""
+        bgpvpn = payload['bgpvpn']
+        bgp_speaker_id = bgpvpn['speaker_id']
+        bgpvpn_id = bgpvpn['bgpvpn_id']
+
+        LOG.debug('Received BGP VPN disassociation notification for '
+                  'speaker_id=%(speaker_id)s bgpvpn_id=%(bgpvpn_id)s from the '
+                  'neutron server.',
+                  {'speaker_id': bgp_speaker_id,
+                   'bgpvpn_id': bgpvpn_id})
+        self.remove_bgpvpn_from_speaker(bgp_speaker_id, bgpvpn_id)
+
+    def bgpvpn_update_gateways(self, updates):
+        self.bgpvpn_rpc.bgpvpn_update_gateways(self.context, updates)
+
+    def bgpvpn_update_devices(self, updates):
+        self.bgpvpn_rpc.bgpvpn_update_devices(self.context, updates)
+
 
 class BgpDrPluginApi(object):
     """Agent side of BgpDrAgent RPC API.
@@ -559,6 +746,15 @@ class BgpDrPluginApi(object):
         return cctxt.call(context, 'get_bgp_peer_info',
                           bgp_peer_id=bgp_peer_id)
 
+    def update_bgp_dragent_peer_state(self, context, host,
+                                      remote_ip, remote_as,
+                                      peer_state):
+        """Make a remote process call to save BGP dragent peer state."""
+        cctxt = self.client.prepare()
+        return cctxt.call(context, 'update_bgp_dragent_peer_state',
+                          host=host, remote_ip=remote_ip, remote_as=remote_as,
+                          peer_state=peer_state)
+
 
 class BgpSpeakerCache(object):
     """Agent cache of the current BGP speaker state.
@@ -580,6 +776,11 @@ class BgpSpeakerCache(object):
             self.remove_bgp_speaker_by_id(self.cache[bgp_speaker['id']])
         self.cache[bgp_speaker['id']] = {'bgp_speaker': bgp_speaker,
                                          'peers': {},
+                                         'bgpvpns': {},
+                                         'networks': {},
+                                         'vnis': {},
+                                         'local_devices': {},
+                                         'local_gateways': {},
                                          'advertised_routes': []}
 
     def get_bgp_speaker_by_id(self, bgp_speaker_id):
@@ -655,8 +856,146 @@ class BgpSpeakerCache(object):
                 'bgp_peers': num_bgp_peers,
                 'advertise_routes': num_advertised_routes}
 
+    def put_bgpvpn(self, bgp_speaker_id, bgpvpn):
+        if bgpvpn['id'] in self.get_bgpvpn_ids(bgp_speaker_id):
+            del self.cache[bgp_speaker_id]['bgpvpns'][bgpvpn['id']]
+
+        self.cache[bgp_speaker_id]['bgpvpns'][bgpvpn['id']] = bgpvpn
+        for network_id in bgpvpn['networks']:
+            # l3vpn can be associated to multiple networks
+            self.cache[bgp_speaker_id]['networks'][network_id] = bgpvpn
+
+        vni = bgpvpn['vni']
+        self.cache[bgp_speaker_id]['vnis'][vni] = bgpvpn
+
+    def is_bgpvpn_added(self, bgp_speaker_id, bgpvpn_id):
+        return self.get_bgpvpn_by_id(bgp_speaker_id, bgpvpn_id)
+
+    def get_bgpvpn_ids(self, bgp_speaker_id):
+        bgp_speaker = self.get_bgp_speaker_by_id(bgp_speaker_id)
+        if bgp_speaker:
+            return self.cache[bgp_speaker_id]['bgpvpns'].keys()
+
+    def get_bgpvpn_by_id(self, bgp_speaker_id, bgpvpn_id):
+        bgp_speaker = self.get_bgp_speaker_by_id(bgp_speaker_id)
+        if bgp_speaker:
+            return self.cache[bgp_speaker_id]['bgpvpns'].get(bgpvpn_id)
+
+    def get_bgpvpns_by_network_id(self, network_id):
+        # NOTE(alegacy): VPNs can be mapped to multiple speakers even though
+        # we only need to support a single association.  For the sake of
+        # completeness return a list of (speaker_id, bgpvpn) so that we
+        # treat each one individually.
+        bgpvpns = [(bgp_speaker_id, c['networks'][network_id])
+                   for bgp_speaker_id, c in six.iteritems(self.cache)
+                   if network_id in c['networks']]
+        return bgpvpns
+
+    def get_bgpvpn_by_vni(self, vni):
+        # NOTE(alegacy): VPNs can be mapped to multiple speakers even though
+        # we only need to support a single association.  For the sake of
+        # completeness return a list of (speaker_id, bgpvpn) so that we
+        # treat each one individually.
+        vnis = [c['vnis'][vni]
+                for c in six.itervalues(self.cache)
+                if vni in c['vnis']]
+        assert len(vnis) <= 1
+        return vnis[0] if vnis else None
+
+    def remove_bgpvpn_by_id(self, bgp_speaker_id, bgpvpn_id):
+        bgpvpn = self.get_bgpvpn_by_id(bgp_speaker_id, bgpvpn_id)
+        if not bgpvpn:
+            return
+        speaker_cache = self.cache[bgp_speaker_id]
+        for network_id in bgpvpn['networks']:
+            # l3vpn can be associated to multiple networks
+            self.cache[bgp_speaker_id]['networks'].pop(network_id, None)
+
+        vni = bgpvpn['vni']
+        speaker_cache['vnis'].pop(vni, None)
+        speaker_cache['bgpvpns'].pop(bgpvpn_id, None)
+        speaker_cache['local_devices'].pop(vni, None)
+        speaker_cache['local_gateways'].pop(vni, None)
+
+    def get_bgpvpn_device_keys(self, bgp_speaker_id, bgpvpn):
+        bgp_speaker = self.get_bgp_speaker_by_id(bgp_speaker_id)
+        if not bgp_speaker:
+            return []
+        speaker_cache = self.cache[bgp_speaker_id]
+        if bgpvpn['vni'] not in speaker_cache['local_devices']:
+            return []
+        network = speaker_cache['local_devices'][bgpvpn['vni']]
+        return network.keys()
+
+    @staticmethod
+    def make_device_key(device):
+        ip_family = netaddr.IPAddress(device['gateway_ip']).version
+        return "v{}-{}-{}".format(
+            ip_family, device['ip_address'], device['mac_address'])
+
+    def put_bgpvpn_device(self, bgp_speaker_id, bgpvpn, device):
+        bgp_speaker = self.get_bgp_speaker_by_id(bgp_speaker_id)
+        if not bgp_speaker:
+            return
+        speaker_cache = self.cache[bgp_speaker_id]
+        if bgpvpn['vni'] not in speaker_cache['local_devices']:
+            speaker_cache['local_devices'][bgpvpn['vni']] = {}
+        network = speaker_cache['local_devices'][bgpvpn['vni']]
+        network[self.make_device_key(device)] = device
+
+    def remove_bgpvpn_device(self, bgp_speaker_id, bgpvpn, device):
+        bgp_speaker = self.get_bgp_speaker_by_id(bgp_speaker_id)
+        if not bgp_speaker:
+            return
+        key = self.make_device_key(device)
+        cached_device = self.get_bgpvpn_device(bgp_speaker_id, bgpvpn, key)
+        if not cached_device:
+            return
+        network = self.cache[bgp_speaker_id]['local_devices'][bgpvpn['vni']]
+        del network[key]
+
+    def get_bgpvpn_device(self, bgp_speaker_id, bgpvpn, key):
+        bgp_speaker = self.get_bgp_speaker_by_id(bgp_speaker_id)
+        if not bgp_speaker:
+            return
+        speaker_cache = self.cache[bgp_speaker_id]
+        if bgpvpn['vni'] not in speaker_cache['local_devices']:
+            return
+        network = speaker_cache['local_devices'][bgpvpn['vni']]
+        return network.get(key)
+
+    def put_bgpvpn_gateway(self, bgp_speaker_id, bgpvpn, gateway_ip):
+        bgp_speaker = self.get_bgp_speaker_by_id(bgp_speaker_id)
+        if not bgp_speaker:
+            return
+        speaker_cache = self.cache[bgp_speaker_id]
+        if bgpvpn['vni'] not in speaker_cache['local_gateways']:
+            speaker_cache['local_gateways'][bgpvpn['vni']] = set()
+        speaker_cache['local_gateways'][bgpvpn['vni']].add(gateway_ip)
+
+    def remove_bgpvpn_gateway(self, bgp_speaker_id, bgpvpn, gateway_ip):
+        bgp_speaker = self.get_bgp_speaker_by_id(bgp_speaker_id)
+        if not bgp_speaker:
+            return
+        speaker_cache = self.cache[bgp_speaker_id]
+        if bgpvpn['vni'] not in speaker_cache['local_gateways']:
+            return
+        gateways = speaker_cache['local_gateways'][bgpvpn['vni']]
+        if gateway_ip in gateways:
+            gateways.remove(gateway_ip)
+
+    def get_bgpvpn_gateways(self, bgp_speaker_id, bgpvpn):
+        bgp_speaker = self.get_bgp_speaker_by_id(bgp_speaker_id)
+        if not bgp_speaker:
+            return set()
+        speaker_cache = self.cache[bgp_speaker_id]
+        if bgpvpn['vni'] not in speaker_cache['local_gateways']:
+            return set()
+        return speaker_cache['local_gateways'][bgpvpn['vni']]
+
 
 class BgpDrAgentWithStateReport(BgpDrAgent):
+
     def __init__(self, host, conf=None):
         super(BgpDrAgentWithStateReport,
               self).__init__(host, conf)
@@ -700,6 +1039,7 @@ class BgpDrAgentWithStateReport(BgpDrAgent):
         if self.agent_state.pop('start_flag', None):
             self.run()
 
+    @utils.synchronized('bgp-dr-agent')
     def agent_updated(self, context, payload):
         """Handle the agent_updated notification event."""
         self.schedule_full_resync(
@@ -708,3 +1048,461 @@ class BgpDrAgentWithStateReport(BgpDrAgent):
 
     def after_start(self):
         LOG.info(_LI("BGP dynamic routing agent started"))
+
+
+class BgpDrL2PopHandler(l2population_rpc.L2populationRpcCallBackMixin):
+
+    def __init__(self, manager):
+        self.manager = manager
+
+    def fdb_add(self, context, fdb_entries):
+        self.manager.fdb_add(context, fdb_entries)
+
+    def fdb_remove(self, context, fdb_entries):
+        self.manager.fdb_remove(context, fdb_entries)
+
+    def fdb_update(self, context, fdb_entries):
+        self.manager.fdb_update(context, fdb_entries)
+
+
+class BgpBatchedEventNotifier(object):
+    """Batches events received from BGP to minimize RPC calls to the server.
+
+    This call handles incoming events from BGP speakers.  Events are queued
+    internal for a configured period of time and then sent to the server for
+    processing and distribution to other nodes.
+
+    Conflicting events that are received are merged before sending to the
+    server (i.e., a route that is withdrawn and the re-added is only sent up
+    as an add to the server).
+    """
+
+    # Accumulate events for 5 seconds before sending an RPC event
+    BATCH_INTERVAL = 5
+
+    def __init__(self, agent, *args, **kwargs):
+        self.agent = agent
+        self.batch = batch_notifier.BatchNotifier(
+            self.BATCH_INTERVAL, self.batch_callback)
+        self.gateway_events = {}
+        self.device_events = {}
+
+    def queue_event(self, event):
+        self.batch.queue_event(event)
+
+    def queue_retry(self):
+        event = {'__retry__': True}
+        self.batch.queue_event(event)
+
+    def _merge_gateway_event(self, event):
+        bgpvpn_id = event['bgpvpn_id']
+        if bgpvpn_id not in self.gateway_events:
+            self.gateway_events[bgpvpn_id] = {}
+        # replace the latest state for this entry
+        self.gateway_events[bgpvpn_id][event['nexthop']] = event
+
+    def _format_gateway_updates(self):
+        """Formats VTEP events to comply with the server RPC format.
+
+        see networking_bgp.neutron.api.rpc.py for details.
+        """
+        updates = {}
+        for bgpvpn_id, events in six.iteritems(self.gateway_events):
+            updates[bgpvpn_id] = [{'ip_address': e['nexthop'],
+                                   'withdrawn': e['is_withdraw']}
+                                  for e in six.itervalues(events)]
+        return updates
+
+    def _merge_device_event(self, event):
+        bgpvpn_id = event['bgpvpn_id']
+        if bgpvpn_id not in self.device_events:
+            self.device_events[bgpvpn_id] = {}
+        # replace the latest state for this entry
+        key = "%s-%s" % (event['mac_address'], event['ip_address'])
+        self.device_events[bgpvpn_id][key] = event
+
+    def _format_device_updates(self):
+        """Formats device events to comply with the server RPC format.
+
+        see networking_bgp.neutron.api.rpc.py for details.
+        """
+        updates = {}
+        for bgpvpn_id, events in six.iteritems(self.device_events):
+            records = []
+            for key, event in six.iteritems(events):
+                records.append({
+                    'ip_address': event['ip_address'],
+                    'mac_address': event['mac_address'],
+                    'gateway_ip': event['nexthop'],
+                    'withdrawn': event['is_withdraw']})
+            updates[bgpvpn_id] = records
+        return updates
+
+    def send_gateway_updates(self):
+        updates = self._format_gateway_updates()
+        try:
+            self.agent.bgpvpn_update_gateways(updates)
+            self.gateway_events = {}
+        except oslo_messaging.exceptions.MessagingTimeout:
+            LOG.error(_LE("Timeout while sending gateway updates; retrying"))
+            self.queue_retry()
+
+    def send_device_updates(self):
+        updates = self._format_device_updates()
+        try:
+            self.agent.bgpvpn_update_devices(updates)
+            self.device_events = {}
+        except oslo_messaging.exceptions.MessagingTimeout:
+            LOG.error(_LE("Timeout while sending device updates; retrying"))
+            self.queue_retry()
+
+    def merge_event(self, event):
+        LOG.debug("New event: {}".format(event))
+        if '__retry__' in event:
+            return  # internal sentinel value; drop it.
+        route_type = event['route_type']
+        if route_type == bgpvpn_constants.BGPEVPN_RT_MULTICAST_ETAG_ROUTE:
+            self._merge_gateway_event(event)
+        elif route_type == bgpvpn_constants.BGPEVPN_RT_MAC_IP_ADV_ROUTE:
+            self._merge_device_event(event)
+        else:
+            LOG.warning(_LW("Ignoring unsupported route type {}: {}").format(
+                route_type, event))
+
+    def batch_callback(self, events):
+        """Handles all batched events at the end of the batch interval."""
+        for event in events:
+            self.merge_event(event)
+        self.send_gateway_updates()
+        self.send_device_updates()
+
+
+class BgpDrAgentWithL2Pop(BgpDrAgentWithStateReport):
+
+    def __init__(self, host, conf=None):
+        super(BgpDrAgentWithL2Pop, self).__init__(host, conf)
+        self.l2pop_handler = None
+        self.l2pop_rpc = l2population_rpc.L2populationRpcQueryMixin()
+        self.l2pop_connection = None
+        self.setup_l2pop_rpc_handler()
+
+    def setup_l2pop_rpc_handler(self):
+        # We need to listen for l2pop RPC events to distribute the FDB
+        # entries to BGP peers.
+        self.l2pop_handler = BgpDrL2PopHandler(self)
+        consumers = [[topics.L2POPULATION, topics.UPDATE]]
+        self.l2pop_connection = agent_rpc.create_consumers(
+            [self.l2pop_handler], topics.AGENT, consumers)
+        self.l2pop_connection.consume_in_threads()
+
+    @staticmethod
+    def _make_device(mac_address, ip_address, gateway_ip):
+        return {'mac_address': mac_address,
+                'ip_address': ip_address,
+                'gateway_ip': gateway_ip}
+
+    def advertise_flooding_entry(self, bgp_speaker_id, bgpvpn, gateway_ip):
+        LOG.info((_LI("advertising flooding entry via {}:{} to speaker {}").
+                  format(gateway_ip, bgpvpn['vni'], bgp_speaker_id)))
+        kwargs = {'ethernet_tag_id': bgpvpn['vni'],
+                  'ip_addr': gateway_ip,
+                  'next_hop': gateway_ip}
+
+        speaker_as = self.cache.get_bgp_speaker_local_as(bgp_speaker_id)
+        route_dist = self._get_route_dist(speaker_as, bgpvpn)
+
+        try:
+            self.dr_driver_cls.advertise_evpn_route(
+                speaker_as,
+                bgpvpn_constants.BGPEVPN_RT_MULTICAST_ETAG_ROUTE,
+                route_dist, **kwargs)
+        except Exception as e:
+            self._handle_driver_failure(bgp_speaker_id,
+                                        'advertise_evpn_route', e)
+        self.cache.put_bgpvpn_gateway(bgp_speaker_id, bgpvpn, gateway_ip)
+
+    def withdraw_flooding_entry(self, bgp_speaker_id, bgpvpn, gateway_ip):
+        LOG.info((_LI("withdrawing flooding entry via {}:{} to speaker {}").
+                  format(gateway_ip, bgpvpn['vni'], bgp_speaker_id)))
+        kwargs = {'ethernet_tag_id': bgpvpn['vni'],
+                  'ip_addr': gateway_ip}
+
+        speaker_as = self.cache.get_bgp_speaker_local_as(bgp_speaker_id)
+        route_dist = self._get_route_dist(speaker_as, bgpvpn)
+
+        try:
+            self.dr_driver_cls.withdraw_evpn_route(
+                speaker_as,
+                bgpvpn_constants.BGPEVPN_RT_MULTICAST_ETAG_ROUTE,
+                route_dist, **kwargs)
+        except Exception as e:
+            self._handle_driver_failure(bgp_speaker_id,
+                                        'withdraw_evpn_route', e)
+        self.cache.remove_bgpvpn_gateway(bgp_speaker_id, bgpvpn, gateway_ip)
+
+    def add_device_to_cache(self, bgp_speaker_id, bgpvpn, gateway_ip,
+                            mac_address, ip_address):
+        device = self._make_device(mac_address, ip_address, gateway_ip)
+        self.cache.put_bgpvpn_device(bgp_speaker_id, bgpvpn, device)
+
+    def advertise_mac_ip_entry(self, bgp_speaker_id, bgpvpn, gateway_ip,
+                               mac_address, ip_address):
+        LOG.info((_LI("advertising MAC:IP {}:{} via {}:{} to speaker {}").
+                 format(mac_address, ip_address, gateway_ip, bgpvpn['vni'],
+                        bgp_speaker_id)))
+        kwargs = {'esi': 0,
+                  'ethernet_tag_id': 0,
+                  'ip_addr': ip_address,
+                  'mac_addr': mac_address,
+                  'vni': bgpvpn['vni'],
+                  'next_hop': gateway_ip,
+                  'tunnel_type': 'vxlan'}
+
+        speaker_as = self.cache.get_bgp_speaker_local_as(bgp_speaker_id)
+        route_dist = self._get_route_dist(speaker_as, bgpvpn)
+
+        try:
+            # NOTE(alegacy): regardless of whether we had previously
+            # advertised this mac:ip from a different next hop or not we
+            # simply advertise it again.  The driver and the peer routers
+            # implicitly revoke the previous advertisement and use the
+            # current advertised next hop to reach this mac:ip.
+            self.dr_driver_cls.advertise_evpn_route(
+                speaker_as,
+                bgpvpn_constants.BGPEVPN_RT_MAC_IP_ADV_ROUTE,
+                route_dist, **kwargs)
+        except Exception as e:
+            self._handle_driver_failure(bgp_speaker_id,
+                                        'advertise_evpn_route', e)
+        self.add_device_to_cache(bgp_speaker_id, bgpvpn, gateway_ip,
+                                 mac_address, ip_address)
+
+    def device_present_in_cache(self, bgp_speaker_id, bgpvpn, gateway_ip,
+                                mac_address, ip_address):
+        device = self._make_device(mac_address, ip_address, gateway_ip)
+        key = self.cache.make_device_key(device)
+        cached_device = self.cache.get_bgpvpn_device(
+            bgp_speaker_id, bgpvpn, key)
+        if self._same_device(device, cached_device):
+            return True
+        return False
+
+    def remove_device_from_cache(self, bgp_speaker_id, bgpvpn, gateway_ip,
+                                 mac_address, ip_address):
+        device = self._make_device(mac_address, ip_address, gateway_ip)
+        self.cache.remove_bgpvpn_device(bgp_speaker_id, bgpvpn, device)
+
+    def withdraw_mac_ip_entry(self, bgp_speaker_id, bgpvpn, gateway_ip,
+                              mac_address, ip_address):
+        if not self.device_present_in_cache(
+                bgp_speaker_id, bgpvpn, gateway_ip, mac_address, ip_address):
+            LOG.debug(("nothing to withdraw for MAC:IP {}:{} via {}:{} to "
+                       "speaker {}").
+                      format(mac_address, ip_address, gateway_ip,
+                             bgpvpn['vni'], bgp_speaker_id))
+            return
+        LOG.info((_LI("withdrawing MAC:IP {}:{} via {}:{} to speaker {}").
+                 format(mac_address, ip_address, gateway_ip,
+                        bgpvpn['vni'], bgp_speaker_id)))
+        kwargs = {'esi': 0,
+                  'ethernet_tag_id': 0,
+                  'ip_addr': ip_address,
+                  'mac_addr': mac_address}
+
+        speaker_as = self.cache.get_bgp_speaker_local_as(bgp_speaker_id)
+        route_dist = self._get_route_dist(speaker_as, bgpvpn)
+
+        try:
+            self.dr_driver_cls.withdraw_evpn_route(
+                speaker_as,
+                bgpvpn_constants.BGPEVPN_RT_MAC_IP_ADV_ROUTE,
+                route_dist, **kwargs)
+        except Exception as e:
+            self._handle_driver_failure(bgp_speaker_id,
+                                        'withdraw_evpn_route', e)
+        self.remove_device_from_cache(bgp_speaker_id, bgpvpn, gateway_ip,
+                                      mac_address, ip_address)
+
+    @staticmethod
+    def select_gateway_ip(agent_ips):
+        """Select an VTEP IP address to use for route advertisements.
+
+        Our l2population distribution supports a mixed environment of IPv4
+        and IPv6 addresses.  For the purpose of advertising to the BGP
+        domain we should only advertise a single nexthop route for each
+        destination.  If we were to advertise multiple the driver would only
+        publish the first one anyway; therefore, we need to pick one.  To
+        facilitate transitions from IPv4 to IPv6 we are going to pick the
+        IPv6 address because our assuming is that if IPv6 addresses have
+        been added then the customer wants to start using them and
+        eventually they will remove the IPv4 addresses.
+        """
+        agent_list = agent_ips.split(',')
+        agent_v6 = [a for a in agent_list if netaddr.IPAddress(a).version == 6]
+        if agent_v6:
+            return agent_v6[0]
+        agent_v4 = [a for a in agent_list if netaddr.IPAddress(a).version == 4]
+        if agent_v4:
+            return agent_v4[0]
+        return None
+
+    def _process_fdb_for_speaker(self, bgp_speaker_id, bgpvpn, fdb_entries,
+                                 mac_handler, flood_handler):
+        """
+        Handle new FDB entries for a given bgp_speaker.
+        """
+        port_entries = fdb_entries['ports']
+        LOG.debug("processing FDB entries for speaker {} bgpvpn {}: {}".format(
+            bgp_speaker_id, bgpvpn['id'], fdb_entries))
+        for agent_ips, ports in six.iteritems(port_entries):
+            gateway_ip = self.select_gateway_ip(agent_ips)
+            for p in ports:
+                if p != constants.FLOODING_ENTRY:
+                    mac_handler(bgp_speaker_id, bgpvpn, gateway_ip,
+                                p.mac_address, p.ip_address)
+                else:
+                    flood_handler(bgp_speaker_id, bgpvpn, gateway_ip)
+
+    @utils.synchronized('bgp-dr-agent')
+    def fdb_add(self, context, fdb_entries):
+        """
+        Handle new FDB entries published to this agent (or all agents).
+        """
+        LOG.debug("fdb_add received: {}".format(fdb_entries))
+        if fdb_entries.get('source') == bgpvpn_constants.BGPVPN:
+            return  # Ignore data originating from this BGP agent or another.
+        for network_id, fdb_entries in six.iteritems(fdb_entries):
+            bgpvpns = self.cache.get_bgpvpns_by_network_id(network_id)
+            for bgp_speaker_id, bgpvpn in bgpvpns:
+                self._process_fdb_for_speaker(
+                    bgp_speaker_id, bgpvpn, fdb_entries,
+                    self.advertise_mac_ip_entry,
+                    self.advertise_flooding_entry)
+
+    @utils.synchronized('bgp-dr-agent')
+    def fdb_remove(self, context, fdb_entries):
+        """
+        Handle new FDB entries published to this agent (or all agents).
+        """
+        LOG.debug("fdb_remove received {}".format(fdb_entries))
+        if fdb_entries.get('source') == bgpvpn_constants.BGPVPN:
+            return  # Ignore data originating from this BGP agent or another.
+        for network_id, fdb_entries in six.iteritems(fdb_entries):
+            bgpvpns = self.cache.get_bgpvpns_by_network_id(network_id)
+            for bgp_speaker_id, bgpvpn in bgpvpns:
+                self._process_fdb_for_speaker(
+                    bgp_speaker_id, bgpvpn, fdb_entries,
+                    self.withdraw_mac_ip_entry,
+                    self.withdraw_flooding_entry)
+
+    def _process_ip_change_for_network(self, bgp_speaker_id, bgpvpn,
+                                       ip_changes):
+        """
+        Handle new FDB entries for a given network_id.
+        """
+        LOG.debug("processing FDB changes for speaker {} bgpvpn {}: {}".format(
+            bgp_speaker_id, bgpvpn['id'], ip_changes))
+        for agent_ips, changes in six.iteritems(ip_changes):
+            gateway_ip = self.select_gateway_ip(agent_ips)
+            for p in changes.get('before', []):
+                self.withdraw_mac_ip_entry(
+                    bgp_speaker_id, bgpvpn, gateway_ip,
+                    p.mac_address, p.ip_address)
+            for p in changes.get('after', []):
+                self.advertise_mac_ip_entry(
+                    bgp_speaker_id, bgpvpn, gateway_ip,
+                    p.mac_address, p.ip_address)
+
+    @utils.synchronized('bgp-dr-agent')
+    def fdb_update(self, context, fdb_entries):
+        LOG.debug("fdb_update received {}".format(fdb_entries))
+        ip_delta = fdb_entries['chg_ip']
+        for network_id, ip_changes in six.iteritems(ip_delta):
+            bgpvpns = self.cache.get_bgpvpns_by_network_id(network_id)
+            for bgp_speaker_id, bgpvpn in bgpvpns:
+                self._process_ip_change_for_network(
+                    bgp_speaker_id, bgpvpn, ip_changes)
+
+    @staticmethod
+    def _same_device(a, b):
+        return (a['ip_address'] == b['ip_address'] and
+                a['gateway_ip'] == b['gateway_ip'])
+
+    def _audit_mac_ip_entry(self, bgp_speaker_id, bgpvpn,
+                            mac_address, ip_address, gateway_ip, keys):
+        device = self._make_device(mac_address, ip_address, gateway_ip)
+        key = self.cache.make_device_key(device)
+        cached_device = self.cache.get_bgpvpn_device(
+            bgp_speaker_id, bgpvpn, key)
+        if not cached_device:
+            # Add new entry
+            self.advertise_mac_ip_entry(
+                bgp_speaker_id, bgpvpn, gateway_ip, mac_address, ip_address)
+        elif self._same_device(device, cached_device):
+            # No action necessary
+            keys.remove(self.cache.make_device_key(cached_device))
+        else:
+            # Replace stale entry
+            self.withdraw_mac_ip_entry(
+                bgp_speaker_id, bgpvpn,
+                cached_device['gateway_ip'],
+                cached_device['mac_address'],
+                cached_device['ip_address'])
+            keys.remove(self.cache.make_device_key(cached_device))
+            self.advertise_mac_ip_entry(
+                bgp_speaker_id, bgpvpn, gateway_ip, mac_address, ip_address)
+
+    def _audit_flood_entry(self, bgp_speaker_id, bgpvpn, gateway_ip, keys):
+        if gateway_ip in keys:
+            keys.remove(gateway_ip)
+            return
+        self.advertise_flooding_entry(bgp_speaker_id, bgpvpn, gateway_ip)
+
+    def _audit_fdb_for_speaker(self, bgp_speaker_id, bgpvpn, fdb_entries):
+        original_devices = set(self.cache.get_bgpvpn_device_keys(
+            bgp_speaker_id, bgpvpn))
+        original_vteps = self.cache.get_bgpvpn_gateways(bgp_speaker_id, bgpvpn)
+        port_entries = fdb_entries['ports']
+        for agent_ips, ports in six.iteritems(port_entries):
+            gateway_ip = self.select_gateway_ip(agent_ips)
+            for p in ports:
+                if p == constants.FLOODING_ENTRY:
+                    self._audit_flood_entry(bgp_speaker_id, bgpvpn,
+                                            gateway_ip,
+                                            original_vteps)
+                else:
+                    self._audit_mac_ip_entry(bgp_speaker_id, bgpvpn,
+                                             p.mac_address,
+                                             p.ip_address,
+                                             gateway_ip,
+                                             original_devices)
+        # Any remaining devices in initial cached set need to be withdrawn
+        for key in original_devices:
+            cached_device = self.cache.get_bgpvpn_device(
+                bgp_speaker_id, bgpvpn, key)
+            self.withdraw_mac_ip_entry(
+                bgp_speaker_id, bgpvpn,
+                cached_device['gateway_ip'],
+                cached_device['mac_address'],
+                cached_device['ip_address'])
+        # Any remaining vteps in initial cached set need to be withdrawn
+        for gateway_ip in original_vteps:
+            self.withdraw_flooding_entry(bgp_speaker_id, bgpvpn, gateway_ip)
+
+    def add_bgpvpn_to_speaker(self, bgp_speaker_id, bgpvpn):
+        if not super(BgpDrAgentWithL2Pop, self).add_bgpvpn_to_speaker(
+                bgp_speaker_id, bgpvpn):
+            return
+        LOG.debug("Auditing FDB for bgpvpn_id {}".format(bgpvpn['id']))
+        # Get the latest copy of the FDB entries for this network
+        fdb_entries = self.l2pop_rpc.get_fdb_entries(
+            self.context, bgpvpn['networks'],
+            source=bgpvpn_constants.BGPVPN)
+        # Check them against what we have already cached and refresh peers
+        for network_id, fdb_entries in six.iteritems(fdb_entries):
+            bgpvpns = self.cache.get_bgpvpns_by_network_id(network_id)
+            for speaker_id, bgpvpn in bgpvpns:
+                if speaker_id != bgp_speaker_id:
+                    continue
+                self._audit_fdb_for_speaker(
+                    bgp_speaker_id, bgpvpn, fdb_entries)

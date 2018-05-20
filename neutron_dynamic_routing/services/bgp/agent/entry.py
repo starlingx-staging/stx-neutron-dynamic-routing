@@ -44,5 +44,5 @@ def main():
         topic=bgp_consts.BGP_DRAGENT,
         report_interval=cfg.CONF.AGENT.report_interval,
         manager='neutron_dynamic_routing.services.bgp.agent.bgp_dragent.'
-                'BgpDrAgentWithStateReport')
+                'BgpDrAgentWithL2Pop')
     service.launch(cfg.CONF, server).wait()

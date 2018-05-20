@@ -43,7 +43,8 @@ FAKE_BGP_SPEAKER = {'id': FAKE_BGPSPEAKER_UUID,
                                'peer_ip': '1.1.1.1',
                                'auth_type': 'none',
                                'password': ''}],
-                    'advertised_routes': []}
+                    'advertised_routes': [],
+                    'bgpvpns': []}
 
 FAKE_BGP_PEER = {'id': FAKE_BGPPEER_UUID,
                  'remote_as': '2345',
@@ -329,7 +330,8 @@ class TestBgpDrAgent(base.BaseTestCase):
         bgp_speaker = {'id': 'foo-id',
                        'local_as': 12345,
                        'peers': peers,
-                       'advertised_routes': []}
+                       'advertised_routes': [],
+                       'bgpvpns': []}
 
         cached_peers = {'1.1.1.1': {'id': 'peer-2', 'peer_ip': '1.1.1.1'},
                         '3.3.3.3': {'id': 'peer-3', 'peer_ip': '3.3.3.3'}}
@@ -350,7 +352,8 @@ class TestBgpDrAgent(base.BaseTestCase):
         bgp_speaker = {'id': 'foo-id',
                        'local_as': 12345,
                        'peers': {},
-                       'advertised_routes': adv_routes}
+                       'advertised_routes': adv_routes,
+                       'bgpvpns': []}
 
         cached_adv_routes = [{'destination': '20.0.0.0/24',
                               'next_hop': '2.2.2.2'},
@@ -358,9 +361,11 @@ class TestBgpDrAgent(base.BaseTestCase):
                               'next_hop': '3.3.3.3'}]
 
         cached_bgp_speaker = {
-            'foo-id': {'bgp_speaker': {'local_as': 12345},
+            'foo-id': {'bgp_speaker': {'local_as': 12345,
+                                       'bgpvpns': []},
                        'peers': {},
-                       'advertised_routes': cached_adv_routes}}
+                       'advertised_routes': cached_adv_routes,
+                       'bgpvpns': {}}}
 
         self._test_sync_bgp_speaker_helper(
             bgp_speaker, cached_info=cached_bgp_speaker,
@@ -379,12 +384,15 @@ class TestBgpDrAgent(base.BaseTestCase):
         bgp_speaker = {'id': 'foo-id',
                        'local_as': 12345,
                        'peers': peers,
-                       'advertised_routes': adv_routes}
+                       'advertised_routes': adv_routes,
+                       'bgpvpns': []}
 
         cached_bgp_speaker = {
-            'foo-id': {'bgp_speaker': {'local_as': 12345},
+            'foo-id': {'bgp_speaker': {'local_as': 12345,
+                                       'bgpvpns': []},
                        'peers': {},
-                       'advertised_routes': []}}
+                       'advertised_routes': [],
+                       'bgpvpns': {}}}
 
         self._test_sync_bgp_speaker_helper(
             bgp_speaker, cached_info=cached_bgp_speaker,
@@ -627,7 +635,12 @@ class TestBGPSpeakerCache(base.BaseTestCase):
         self.expected_cache = {FAKE_BGP_SPEAKER['id']:
                                {'bgp_speaker': FAKE_BGP_SPEAKER,
                                 'peers': {},
-                                'advertised_routes': []}}
+                                'advertised_routes': [],
+                                'bgpvpns': {},
+                                'local_devices': {},
+                                'local_gateways': {},
+                                'vnis': {},
+                                'networks': {}}}
         self.bs_cache = bgp_dragent.BgpSpeakerCache()
 
     def test_put_bgp_speaker(self):
